@@ -1,6 +1,9 @@
+import shutil
 import sys
+import time
+import zipfile
 from pathlib import Path
-
+import requests
 from app.core.logger import logger
 from app.import_process.agent.state import ImportGraphState
 from app.utils.task_utils import add_running_task, add_done_task
@@ -109,24 +112,218 @@ def step_2_upload_and_poll(pdf_path_obj: Path, output_dir_obj: Path):
     返回：解析结果ZIP包下载链接full_zip_url
     异常：ValueError(配置缺失)、RuntimeError(请求/上传失败)、TimeoutError(任务超时)
     """
+
     token = MineruConfig.api_key
-    url = f"{MineruConfig.base_url}/file-urls/batch"
-    header = {
+    request_headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}"
     }
-    data = {
-        "url": "https://cdn-mineru.openxlab.org.cn/demo/example.pdf",
+    req_data = {
+        "files": [
+            {"name": pdf_path_obj.name}
+        ],
         "model_version": "vlm"
     }
-    return
 
+    # 1. 调用批量接口，获取上传Signed URL和任务batch_id
+    url_get_upload = f"{MineruConfig.base_url}/file-urls/batch"
+    logger.debug(f"[获取上传链接] 调用接口：{url_get_upload}，请求参数：{req_data}")
+    resp = requests.post(url=url_get_upload, headers=request_headers, json=req_data, timeout=30)
+
+    # 响应校验：先验HTTP状态，再验业务返回码
+    if resp.status_code != 200:
+        raise RuntimeError(f"[获取上传链接] 网络请求失败，状态码：{resp.status_code}，响应内容：{resp.text}")
+
+    resp_data = resp.json()
+    if resp_data["code"] != 0:
+        raise RuntimeError(f"[获取上传链接] API业务错误，返回数据：{resp_data}")
+
+    # 提取核心数据：上传链接和任务唯一标识
+    signed_url = resp_data["data"]["file_urls"][0]
+    batch_id = resp_data["data"]["batch_id"]
+    logger.info(f"[获取上传链接] 成功，batch_id：{batch_id}，上传链接已生成")
+
+    # 2. 读取PDF二进制数据，准备上传
+    logger.info(f"[文件上传] 开始读取PDF文件：{pdf_path_obj.name}")
+    with open(pdf_path_obj, "rb") as f:
+        file_data = f.read()
+
+    # 创建Session（复用TCP连接，禁用代理避免签名验证失败）
+    upload_session = requests.Session()
+    upload_session.trust_env = False
+
+    try:
+        # 首次上传：自动识别文件类型
+        put_resp = upload_session.put(url=signed_url, data=file_data, timeout=60)
+        # 重试逻辑：首次失败则强制指定PDF的Content-Type
+        if put_resp.status_code != 200:
+            logger.warning(f"[文件上传] 首次上传失败（状态码：{put_resp.status_code}），强制指定PDF类型重试")
+            pdf_headers = {"Content-Type": "application/pdf"}
+            put_resp = upload_session.put(url=signed_url, data=file_data, headers=pdf_headers, timeout=60)
+            # 重试仍失败则抛出异常
+            if put_resp.status_code != 200:
+                raise RuntimeError(f"[文件上传] 重试后仍失败，状态码：{put_resp.status_code}，响应内容：{put_resp.text}")
+        logger.info(f"[文件上传] 成功，文件{pdf_path_obj.name}已存入云存储")
+    except Exception as e:
+        raise RuntimeError(f"[文件上传] 网络异常导致上传失败，错误信息：{str(e)}")
+    finally:
+        # 无论成败，关闭Session释放网络连接，避免资源泄漏
+        upload_session.close()
+
+    # 3. 根据batch_id轮询任务状态，直至完成/失败/超时
+    poll_url = f"{MineruConfig.base_url}/extract-results/batch/{batch_id}"
+    start_time = time.time()
+    timeout_seconds = 600  # 最大超时时间10分钟（适配600页内PDF）
+    poll_interval = 3      # 轮询间隔3秒（平衡查询频率和服务端压力）
+    logger.info(f"[任务轮询] 开始监控任务状态，batch_id：{batch_id}，最大超时：{timeout_seconds}s")
+
+    while True:
+        # 超时检查：超过最大时间直接终止轮询
+        elapsed_time = time.time() - start_time
+        if elapsed_time > timeout_seconds:
+            raise TimeoutError(f"[任务轮询] 超时！任务处理超{int(timeout_seconds)}秒，batch_id：{batch_id}")
+
+        # 发起轮询请求，短超时10秒，异常则重试
+        try:
+            poll_resp = requests.get(url=poll_url, headers=request_headers, timeout=10)
+        except Exception as e:
+            logger.warning(f"[任务轮询] 网络请求异常，{poll_interval}秒后重试：{str(e)}")
+            time.sleep(poll_interval)
+            continue
+
+        # 处理HTTP响应错误：5xx服务端繁忙则重试，其他错误直接抛出
+        if poll_resp.status_code != 200:
+            if 500 <= poll_resp.status_code < 600:
+                logger.warning(f"[任务轮询] 服务端繁忙（状态码：{poll_resp.status_code}），{poll_interval}秒后重试")
+                time.sleep(poll_interval)
+                continue
+            else:
+                raise RuntimeError(f"[任务轮询] HTTP请求失败，状态码：{poll_resp.status_code}，响应内容：{poll_resp.text}")
+
+        # 解析轮询结果，校验业务状态
+        poll_data = poll_resp.json()
+        if poll_data["code"] != 0:
+            raise RuntimeError(f"[任务轮询] API业务错误，返回数据：{poll_data}")
+
+        extract_results = poll_data["data"]["extract_result"]
+        # 结果暂空，继续轮询
+        if not extract_results:
+            logger.debug(f"[任务轮询] 结果暂为空，已耗时{int(elapsed_time)}s，继续等待")
+            time.sleep(poll_interval)
+            continue
+
+        # 解析任务状态，分支处理
+        result_item = extract_results[0]
+        state_status = result_item["state"]
+        # 状态1：任务完成，提取ZIP下载链接
+        if state_status == "done":
+            logger.info(f"[任务轮询] 解析任务完成！总耗时：{int(elapsed_time)}s，batch_id：{batch_id}")
+            full_zip_url = result_item.get("full_zip_url")
+            if not full_zip_url:
+                raise RuntimeError("[任务轮询] 任务完成但未返回ZIP包下载链接，batch_id：{batch_id}")
+            logger.info(f"[任务轮询] 结果ZIP包下载链接：{full_zip_url}...")
+            return full_zip_url
+        # 状态2：任务失败，提取错误信息抛出
+        elif state_status == "failed":
+            err_msg = result_item.get("err_msg", "未知错误，无具体信息")
+            raise RuntimeError(f"[任务轮询] 解析任务失败，batch_id：{batch_id}，错误信息：{err_msg}")
+        # 状态3：处理中，实时打印进度（覆盖当前行）
+        else:
+            logger.debug(
+                f"[任务轮询] 处理中（已耗时{int(elapsed_time)}s），状态：{state_status} | 刷新间隔{poll_interval}s",
+                end="\r"
+            )
+            time.sleep(poll_interval)
 # 获取：下载ZIP包并提取MD文件
-def step_3_download_and_extract(state: ImportGraphState):
-    return
+def step_3_download_and_extract(zip_url: str, output_dir_obj: Path, pdf_stem: str) -> str:
+    """
+    步骤3：下载MinerU解析结果ZIP包并解压，提取目标MD文件（重命名统一规范）
+    核心流程：下载ZIP → 清理旧目录并解压 → 查找MD文件（按优先级） → 重命名统一为PDF同名
+    参数：zip_url-ZIP包下载链接；output_dir_obj-输出目录Path；pdf_stem-PDF无后缀纯名称
+    返回：最终MD文件的字符串格式绝对路径
+    异常：RuntimeError(下载失败)、FileNotFoundError(无MD文件)
+    """
+    logger.info(f"===== 开始处理[{pdf_stem}]的MinerU解析结果 =====")
 
-    logger.info(f">>> [Stub] 执行节点: {sys._getframe().f_code.co_name}")
-    return state
+    # 1. 下载解析结果ZIP包，120秒超时适配大文件
+    logger.info(f"[步骤1/4] 开始下载ZIP包，链接：{zip_url}...")
+    resp = requests.get(zip_url, timeout=120)
+    if resp.status_code != 200:
+        raise RuntimeError(f"[步骤1/4] ZIP包下载失败，HTTP状态码：{resp.status_code}")
+
+    # 拼接ZIP包保存路径，按PDF名称唯一命名
+    # 远程服务器 → HTTP响应（resp.content，内存中） → 写入磁盘文件 → 后续解压使用
+    # resp.content是requests.get()从远程服务器拉取到的二进制数据，所以需要写到指定文件中才算是下载下来了
+    zip_save_path = output_dir_obj / f"{pdf_stem}_result.zip"
+    with open(zip_save_path, "wb") as f:
+        f.write(resp.content)
+    logger.info(f"[步骤1/4] ZIP包下载成功，保存路径：{zip_save_path}")
+
+    # 2. 清理旧解压目录并解压ZIP包（避免旧文件干扰，为每个PDF创建专属目录）
+    logger.info(f"[步骤2/4] 开始解压ZIP包...")
+    extract_target_dir = output_dir_obj / pdf_stem
+
+    # 清理旧目录，异常则警告不终止
+    if extract_target_dir.exists():
+        try:
+            # 递归删除整个目录树，包括目录本身及其所有子目录和文件。
+            shutil.rmtree(extract_target_dir)
+            logger.info(f"[步骤2/4] 已清理旧的解压目录：{extract_target_dir}")
+        except Exception as e:
+            logger.warning(f"[步骤2/4] 清理旧目录失败，可能不影响新文件解压：{str(e)}")
+
+    # 重新创建解压目录
+    extract_target_dir.mkdir(parents=True, exist_ok=True)
+
+    # 核心解压操作，保留原目录结构
+    with zipfile.ZipFile(zip_save_path, 'r') as zip_file_obj:
+        zip_file_obj.extractall(extract_target_dir)
+    logger.info(f"[步骤2/4] ZIP包解压完成，解压目录：{extract_target_dir}")
+
+    # 3. 递归查找解压目录下所有MD文件（适配子目录结构）
+    logger.info(f"[步骤3/4] 开始查找解压目录中的MD文件...")
+    md_file_list = list(extract_target_dir.rglob("*.md"))
+    if not md_file_list:
+        raise FileNotFoundError(f"[步骤3/4] 解压目录中未找到任何.md格式文件：{extract_target_dir}")
+    logger.info(f"[步骤3/4] 共找到{len(md_file_list)}个MD文件，按优先级匹配目标文件")
+
+    # 4. 按优先级匹配目标MD文件（同名→full.md→第一个，兜底避免流程中断）
+    target_md_file = None
+    # 优先级1：与PDF纯名称完全同名的MD文件
+    for md_file in md_file_list:
+        if md_file.stem == pdf_stem:
+            target_md_file = md_file
+            logger.info(f"[步骤4/4] 匹配到优先级1目标：与PDF同名的MD文件 {target_md_file.name}")
+            break
+    # 优先级2：MinerU默认生成的full.md（不区分大小写）
+    if not target_md_file:
+        for md_file in md_file_list:
+            if md_file.name.lower() == "full.md":
+                target_md_file = md_file
+                logger.info(f"[步骤4/4] 匹配到优先级2目标：MinerU默认文件 {target_md_file.name}")
+                break
+    # 优先级3：兜底取第一个MD文件
+    if not target_md_file:
+        target_md_file = md_file_list[0]
+        logger.info(f"[步骤4/4] 未匹配到前两级目标，兜底取第一个MD文件 {target_md_file.name}")
+
+    # 重命名MD文件：统一为PDF纯名称，便于后续流程处理（仅不同名时执行）
+    if target_md_file.stem != pdf_stem:
+        logger.info(f"[步骤4/4] 开始重命名MD文件，统一为PDF同名：{pdf_stem}.md")
+        new_md_path = target_md_file.with_name(f"{pdf_stem}.md")
+        try:
+            # 将磁盘上的文件进行重命名
+            target_md_file.rename(new_md_path)
+            # 更新变量引用
+            target_md_file = new_md_path
+            logger.info(f"[步骤4/4] MD文件重命名成功：{pdf_stem}.md")
+        except OSError as e:
+            logger.warning(f"[步骤4/4] MD文件重命名失败，将使用原文件名继续流程：{str(e)}")
+
+    # 转换为字符串绝对路径返回，适配后续仅支持字符串路径的函数
+    final_md_path = str(target_md_file.absolute())
+    logger.info(f"===== [{pdf_stem}]解析结果处理完成，最终MD文件路径：{final_md_path} =====")
+    return final_md_path
 
 
 
