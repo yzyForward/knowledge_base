@@ -95,6 +95,7 @@ def step_1_validate_paths(state: ImportGraphState):
     # 确保输出目录存在，不存在则递归创建
     if not output_dir_obj.exists():
         logger.info(f"{log_prefix}输出目录不存在，自动创建：{output_dir_obj.absolute()}")
+        # 递归创建所有不存在的父级目录，exist_ok=True表示目录已存在时不抛出异常
         output_dir_obj.mkdir(parents=True, exist_ok=True)
 
     return pdf_path_obj, output_dir_obj
