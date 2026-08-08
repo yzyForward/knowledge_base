@@ -1,3 +1,4 @@
+import os
 import shutil
 import sys
 import time
@@ -5,9 +6,9 @@ import zipfile
 from pathlib import Path
 import requests
 from app.core.logger import logger
-from app.import_process.agent.state import ImportGraphState
+from app.import_process.agent.state import ImportGraphState, create_default_state
 from app.utils.task_utils import add_running_task, add_done_task
-from app.conf.mineru_config import MineruConfig
+from app.conf.mineru_config import mineru_config
 
 
 def node_pdf_to_md(state: ImportGraphState) -> ImportGraphState:
@@ -113,7 +114,7 @@ def step_2_upload_and_poll(pdf_path_obj: Path, output_dir_obj: Path):
     异常：ValueError(配置缺失)、RuntimeError(请求/上传失败)、TimeoutError(任务超时)
     """
 
-    token = MineruConfig.api_key
+    token = mineru_config.api_key
     request_headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}"
@@ -126,7 +127,7 @@ def step_2_upload_and_poll(pdf_path_obj: Path, output_dir_obj: Path):
     }
 
     # 1. 调用批量接口，获取上传Signed URL和任务batch_id
-    url_get_upload = f"{MineruConfig.base_url}/file-urls/batch"
+    url_get_upload = f"{mineru_config.base_url}/file-urls/batch"
     logger.debug(f"[获取上传链接] 调用接口：{url_get_upload}，请求参数：{req_data}")
     resp = requests.post(url=url_get_upload, headers=request_headers, json=req_data, timeout=30)
 
@@ -171,7 +172,7 @@ def step_2_upload_and_poll(pdf_path_obj: Path, output_dir_obj: Path):
         upload_session.close()
 
     # 3. 根据batch_id轮询任务状态，直至完成/失败/超时
-    poll_url = f"{MineruConfig.base_url}/extract-results/batch/{batch_id}"
+    poll_url = f"{mineru_config.base_url}/extract-results/batch/{batch_id}"
     start_time = time.time()
     timeout_seconds = 600  # 最大超时时间10分钟（适配600页内PDF）
     poll_interval = 3      # 轮询间隔3秒（平衡查询频率和服务端压力）
@@ -325,6 +326,28 @@ def step_3_download_and_extract(zip_url: str, output_dir_obj: Path, pdf_stem: st
     logger.info(f"===== [{pdf_stem}]解析结果处理完成，最终MD文件路径：{final_md_path} =====")
     return final_md_path
 
+if __name__ == "__main__":
+
+    # 单元测试：验证PDF转MD全流程
+    logger.info("===== 开始node_pdf_to_md节点单元测试 =====")
+
+    from app.utils.path_util import PROJECT_ROOT
+    logger.info(f"测试获取根地址：{PROJECT_ROOT}")
+
+    test_pdf_name = os.path.join("doc", "hak180产品安全手册.pdf")
+    test_pdf_path = os.path.join(PROJECT_ROOT, test_pdf_name)
+    print(f"测试PDF路径：{test_pdf_path}")
+
+    # 构造测试状态
+    test_state = create_default_state(
+        task_id="test_pdf2md_task_001",
+        pdf_path=test_pdf_path,
+        local_dir=os.path.join(PROJECT_ROOT, "output")
+    )
+    print(f"测试状态：{test_state}")
+    node_pdf_to_md(test_state)
+
+    logger.info("===== 结束node_pdf_to_md节点单元测试 =====")
 
 
 
